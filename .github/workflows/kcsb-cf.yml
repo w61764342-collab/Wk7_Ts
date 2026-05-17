@@ -1,10 +1,10 @@
-name: KCSB Data Scraper
+name: Cloudflare R2 pipeline
 
 on:
-  # Run quarterly on the 1st of January, April, July, and October at 12:00 PM UTC
+  # Same quarterly schedule as the AWS S3 workflow
   schedule:
     - cron: '0 12 1 1,4,7,10 *'
-  
+
   # Allow manual trigger with category selection
   workflow_dispatch:
     inputs:
@@ -32,51 +32,62 @@ on:
           - '8'
 
 jobs:
-  scrape-data:
-    name: Scrape KCSB Data
+  scrape-data-r2:
+    name: Scrape KCSB Data → Cloudflare R2
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      
-      - name: Run scraper for specific category
+
+      # ---------------------------------------------------------------
+      # R2 requires an explicit endpoint URL; no AWS region needed.
+      # Secrets to configure in GitHub:
+      #   CF_R2_ACCESS_KEY_ID      — R2 API token Access Key ID
+      #   CF_R2_SECRET_ACCESS_KEY  — R2 API token Secret Access Key
+      #   CF_R2_ENDPOINT_URL       — https://<account_id>.r2.cloudflarestorage.com
+      #   CF_R2_BUCKET_NAME        — target R2 bucket name
+      # ---------------------------------------------------------------
+
+      - name: Run R2 scraper for specific category
         if: github.event.inputs.category != 'all' && github.event.inputs.category != ''
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+          CF_R2_ACCESS_KEY_ID:     ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          CF_R2_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+          CF_R2_ENDPOINT_URL:      ${{ secrets.CF_R2_ENDPOINT_URL }}
+          CF_R2_BUCKET_NAME:       ${{ secrets.CF_R2_BUCKET_NAME }}
         run: |
           WORKERS="${{ github.event.inputs.workers }}"
           if [ -z "$WORKERS" ]; then WORKERS=5; fi
-          python scraper.py --category "${{ github.event.inputs.category }}" --workers $WORKERS
-      
-      - name: Run scraper for all categories (scheduled or manual)
+          python CF/scraper_cf.py --category "${{ github.event.inputs.category }}" --workers $WORKERS
+
+      - name: Run R2 scraper for all categories (scheduled or manual)
         if: github.event.inputs.category == 'all' || github.event.inputs.category == ''
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+          CF_R2_ACCESS_KEY_ID:     ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          CF_R2_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+          CF_R2_ENDPOINT_URL:      ${{ secrets.CF_R2_ENDPOINT_URL }}
+          CF_R2_BUCKET_NAME:       ${{ secrets.CF_R2_BUCKET_NAME }}
         run: |
           WORKERS="${{ github.event.inputs.workers }}"
           if [ -z "$WORKERS" ]; then WORKERS=5; fi
-          python scraper.py --workers $WORKERS
-      
+          python CF/scraper_cf.py --workers $WORKERS
+
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scraper-logs-${{ github.run_number }}
+          name: scraper-r2-logs-${{ github.run_number }}
           path: |
             *.log
           retention-days: 7
