@@ -1,0 +1,5 @@
+venv/
+__pycache__/scraper.cpython-311.pyc
+TESTING_GUIDE.md
+ANALYSIS.md
+CHANGELOG.md
