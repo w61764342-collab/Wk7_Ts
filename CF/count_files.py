@@ -28,7 +28,7 @@ def count_files(prefix: str) -> int:
     paginator = r2.get_paginator('list_objects_v2')
     total = 0
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        total += page.get('KeyCount', 0)
+        total += len(page.get('Contents', []))
 
     return total
 
