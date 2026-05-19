@@ -27,9 +27,14 @@ def count_files(prefix: str) -> int:
 
     paginator = r2.get_paginator('list_objects_v2')
     total = 0
+    page_num = 0
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        total += len(page.get('Contents', []))
+        page_num += 1
+        count = len(page.get('Contents', []))
+        print(f"  Page {page_num}: {count} objects (IsTruncated={page.get('IsTruncated', False)})")
+        total += count
 
+    print(f"  Total pages fetched: {page_num}")
     return total
 
 
@@ -55,7 +60,12 @@ if __name__ == '__main__':
 
     bucket = os.environ['CF_R2_BUCKET_NAME']
     display_path = args.path or '(entire bucket)'
-    print(f"Counting files in  : {display_path}")
+    # Show the normalised prefix so you can verify it matches your R2 keys
+    normalised = args.path.lstrip('/')
+    if normalised and not normalised.endswith('/'):
+        normalised += '/'
+    print(f"Input path         : {display_path}")
+    print(f"Normalised prefix  : '{normalised}' (empty = entire bucket)")
     print(f"Bucket             : {bucket}")
 
     n = count_files(args.path)
