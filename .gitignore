@@ -3,3 +3,15 @@ __pycache__/scraper.cpython-311.pyc
 TESTING_GUIDE.md
 ANALYSIS.md
 CHANGELOG.md
+websites-config-prompt.md
+skill.md
+websites-config-template.yml
+README.md
+README.md
+DOC/cf_doc.md
+monitor_stats.yml
+monitor/report_*.json
+monitor.md
+prompts/excel-schema-prompt.md
+websites-config.yml
+prompts/monitor-prompt.md
