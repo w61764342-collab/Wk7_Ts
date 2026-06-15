@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Any
@@ -22,6 +23,7 @@ import boto3
 import yaml
 from botocore.config import Config
 from botocore.exceptions import ClientError
+import xlrd
 from openpyxl import load_workbook
 
 MONITOR_PREFIX = "KCSB-Data/monitor"
@@ -181,6 +183,91 @@ def match_profile(key: str, profiles: list[dict]) -> dict | None:
     return None
 
 
+@dataclass
+class SheetView:
+    name: str
+    headers: list[str]
+    rows: list[tuple[Any, ...]]
+    data_row_count: int
+
+
+def detect_spreadsheet_format(content: bytes) -> str:
+    """Return xlsx, xls, pdf, html, or unknown based on file magic bytes."""
+    if len(content) < 4:
+        return "unknown"
+    if content[:2] == b"PK":
+        return "xlsx"
+    if content[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+        return "xls"
+    if content[:4] == b"%PDF":
+        return "pdf"
+    head = content[:256].lstrip().lower()
+    if head.startswith(b"<html") or head.startswith(b"<!doctype"):
+        return "html"
+    return "unknown"
+
+
+def _cell_str(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def read_xlsx_sheet(wb: Any, sheet_name: str) -> SheetView:
+    ws = wb[sheet_name]
+    rows = list(ws.iter_rows(values_only=True))
+    headers = [_cell_str(c) for c in (rows[0] if rows else [])]
+    return SheetView(
+        name=sheet_name,
+        headers=headers,
+        rows=rows,
+        data_row_count=max(len(rows) - 1, 0),
+    )
+
+
+def read_xls_sheet(book: xlrd.book.Book, sheet_name: str) -> SheetView:
+    sheet = book.sheet_by_name(sheet_name)
+    rows = [
+        tuple(_cell_str(sheet.cell_value(r, c)) for c in range(sheet.ncols))
+        for r in range(sheet.nrows)
+    ]
+    headers = list(rows[0]) if rows else []
+    return SheetView(
+        name=sheet_name,
+        headers=headers,
+        rows=rows,
+        data_row_count=max(len(rows) - 1, 0),
+    )
+
+
+def open_spreadsheet(content: bytes) -> tuple[str, list[str], Any]:
+    """
+    Open workbook bytes. Returns (format, sheet_names, handle).
+    handle is openpyxl Workbook or xlrd Book — caller must close/release.
+    """
+    fmt = detect_spreadsheet_format(content)
+    if fmt == "xlsx":
+        wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        return fmt, wb.sheetnames, wb
+    if fmt == "xls":
+        book = xlrd.open_workbook(file_contents=content, on_demand=True)
+        return fmt, book.sheet_names(), book
+    raise ValueError(f"unsupported spreadsheet format: {fmt}")
+
+
+def close_spreadsheet(fmt: str, handle: Any) -> None:
+    if fmt == "xlsx":
+        handle.close()
+    elif fmt == "xls":
+        handle.release_resources()
+
+
+def get_sheet_view(fmt: str, handle: Any, sheet_name: str) -> SheetView:
+    if fmt == "xlsx":
+        return read_xlsx_sheet(handle, sheet_name)
+    return read_xls_sheet(handle, sheet_name)
+
+
 def inspect_excel(
     content: bytes,
     profile: dict,
@@ -200,8 +287,23 @@ def inspect_excel(
     })
     all_passed &= size_ok
 
+    detected = detect_spreadsheet_format(content)
+    if detected in ("pdf", "html", "unknown"):
+        detail = {
+            "pdf": "file is PDF, not Excel",
+            "html": "file is HTML (likely a failed download page)",
+            "unknown": "unrecognised file format",
+        }[detected]
+        checks.append({
+            "check": "file_readable",
+            "severity": SEVERITY_CRITICAL,
+            "passed": False,
+            "detail": detail,
+        })
+        return checks, False
+
     try:
-        wb = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        fmt, sheet_names, handle = open_spreadsheet(content)
     except Exception as exc:
         checks.append({
             "check": "file_readable",
@@ -211,14 +313,25 @@ def inspect_excel(
         })
         return checks, False
 
+    reader = "xlrd (.xls)" if fmt == "xls" else "openpyxl (.xlsx)"
+    format_detail = (
+        f"legacy Excel 97-2003 (.xls) opened with {reader}"
+        if fmt == "xls"
+        else f"Office Open XML (.xlsx) opened with {reader}"
+    )
+    checks.append({
+        "check": "file_format",
+        "severity": SEVERITY_MEDIUM,
+        "passed": True,
+        "detail": format_detail,
+    })
     checks.append({
         "check": "file_readable",
         "severity": SEVERITY_CRITICAL,
         "passed": True,
-        "detail": "openpyxl opened workbook",
+        "detail": format_detail,
     })
 
-    sheet_names = wb.sheetnames
     if not sheet_names:
         checks.append({
             "check": "has_sheets",
@@ -226,19 +339,19 @@ def inspect_excel(
             "passed": False,
             "detail": "workbook has no sheets",
         })
+        close_spreadsheet(fmt, handle)
         return checks, False
 
     sheet_specs = profile.get("sheets", [])
-    for spec in sheet_specs:
-        expected_name = spec.get("name", "*")
-        required_cols = spec.get("required_columns") or []
-        row_min, row_max = spec.get("row_count_range", [1, 999999])
+    try:
+        for spec in sheet_specs:
+            expected_name = spec.get("name", "*")
+            required_cols = spec.get("required_columns") or []
+            row_min, row_max = spec.get("row_count_range", [1, 999999])
 
-        target_sheet = None
-        if expected_name == "*":
-            target_sheet = sheet_names[0]
-        else:
-            if expected_name not in sheet_names:
+            if expected_name == "*":
+                target_sheet = sheet_names[0]
+            elif expected_name not in sheet_names:
                 checks.append({
                     "check": f"sheet_exists:{expected_name}",
                     "severity": SEVERITY_CRITICAL,
@@ -247,54 +360,61 @@ def inspect_excel(
                 })
                 all_passed = False
                 continue
-            target_sheet = expected_name
+            else:
+                target_sheet = expected_name
 
-        ws = wb[target_sheet]
-        rows = list(ws.iter_rows(values_only=True))
-        headers = [str(c).strip() if c is not None else "" for c in (rows[0] if rows else [])]
-        data_rows = max(len(rows) - 1, 0)
+            view = get_sheet_view(fmt, handle, target_sheet)
+            headers = view.headers
+            data_rows = view.data_row_count
+            rows = view.rows
 
-        if required_cols:
-            missing = [c for c in required_cols if c not in headers]
-            cols_ok = not missing
-            checks.append({
-                "check": f"required_columns:{target_sheet}",
-                "severity": SEVERITY_CRITICAL,
-                "passed": cols_ok,
-                "detail": f"missing {missing}" if missing else f"all {len(required_cols)} columns present",
-            })
-            all_passed &= cols_ok
-
-        rows_ok = row_min <= data_rows <= row_max
-        checks.append({
-            "check": f"row_count_range:{target_sheet}",
-            "severity": SEVERITY_MEDIUM,
-            "passed": rows_ok,
-            "detail": f"{data_rows} rows (expected {row_min}–{row_max})",
-        })
-        all_passed &= rows_ok
-
-        if quality and required_cols and data_rows > 0:
-            col_idx = {h: i for i, h in enumerate(headers)}
-            for col in required_cols:
-                if col not in col_idx:
-                    continue
-                idx = col_idx[col]
-                nulls = sum(
-                    1 for row in rows[1:]
-                    if idx >= len(row) or row[idx] is None or str(row[idx]).strip() == ""
-                )
-                null_pct = (nulls / data_rows) * 100
-                null_ok = null_pct <= 50
+            if required_cols:
+                missing = [c for c in required_cols if c not in headers]
+                cols_ok = not missing
                 checks.append({
-                    "check": f"null_pct:{col}",
-                    "severity": SEVERITY_MEDIUM,
-                    "passed": null_ok,
-                    "detail": f"{null_pct:.1f}% null/empty in '{col}'",
+                    "check": f"required_columns:{target_sheet}",
+                    "severity": SEVERITY_CRITICAL,
+                    "passed": cols_ok,
+                    "detail": (
+                        f"missing {missing}"
+                        if missing
+                        else f"all {len(required_cols)} columns present"
+                    ),
                 })
-                all_passed &= null_ok
+                all_passed &= cols_ok
 
-    wb.close()
+            rows_ok = row_min <= data_rows <= row_max
+            checks.append({
+                "check": f"row_count_range:{target_sheet}",
+                "severity": SEVERITY_MEDIUM,
+                "passed": rows_ok,
+                "detail": f"{data_rows} rows (expected {row_min}–{row_max})",
+            })
+            all_passed &= rows_ok
+
+            if quality and required_cols and data_rows > 0:
+                col_idx = {h: i for i, h in enumerate(headers)}
+                for col in required_cols:
+                    if col not in col_idx:
+                        continue
+                    idx = col_idx[col]
+                    nulls = sum(
+                        1
+                        for row in rows[1:]
+                        if idx >= len(row) or row[idx] is None or _cell_str(row[idx]) == ""
+                    )
+                    null_pct = (nulls / data_rows) * 100
+                    null_ok = null_pct <= 50
+                    checks.append({
+                        "check": f"null_pct:{col}",
+                        "severity": SEVERITY_MEDIUM,
+                        "passed": null_ok,
+                        "detail": f"{null_pct:.1f}% null/empty in '{col}'",
+                    })
+                    all_passed &= null_ok
+    finally:
+        close_spreadsheet(fmt, handle)
+
     return checks, all_passed
 
 
