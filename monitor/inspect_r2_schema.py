@@ -11,6 +11,7 @@ import argparse
 import fnmatch
 import io
 import json
+import logging
 import os
 import sys
 from datetime import datetime, timezone
@@ -29,6 +30,18 @@ SEVERITY_CRITICAL = "critical"
 SEVERITY_HIGH = "high"
 SEVERITY_MEDIUM = "medium"
 
+logger = logging.getLogger(__name__)
+
+
+def setup_logging(verbose: bool) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        stream=sys.stdout,
+        force=True,
+    )
+
 
 def load_config(client: Any, bucket: str, local_path: str | None) -> dict:
     """Load websites-config.yml from R2 (default) or a local file (--config-local)."""
@@ -36,6 +49,7 @@ def load_config(client: Any, bucket: str, local_path: str | None) -> dict:
         with open(local_path, encoding="utf-8") as fh:
             data = yaml.safe_load(fh)
         print(f"Config loaded from local file: {local_path}")
+        logger.info("Config loaded from local file: %s", local_path)
         return data
 
     try:
@@ -49,6 +63,7 @@ def load_config(client: Any, bucket: str, local_path: str | None) -> dict:
             ) from exc
         raise
 
+    logger.info("Downloading config from s3://%s/%s", bucket, CONFIG_R2_KEY)
     print(f"Config loaded from s3://{bucket}/{CONFIG_R2_KEY}")
     return yaml.safe_load(body)
 
@@ -88,8 +103,18 @@ def list_objects(client: Any, bucket: str, prefix: str) -> list[dict]:
     prefix = normalise_prefix(prefix)
     paginator = client.get_paginator("list_objects_v2")
     objects: list[dict] = []
+    page_num = 0
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        objects.extend(page.get("Contents", []))
+        page_num += 1
+        batch = page.get("Contents", [])
+        objects.extend(batch)
+        logger.info(
+            "  Listed page %d: %d objects (total so far: %d, truncated=%s)",
+            page_num,
+            len(batch),
+            len(objects),
+            page.get("IsTruncated", False),
+        )
     return objects
 
 
@@ -101,12 +126,25 @@ def download_object(client: Any, bucket: str, key: str) -> bytes:
 def load_existing_stats(client: Any, bucket: str) -> dict:
     key = f"{MONITOR_PREFIX}/monitor_stats.yml"
     try:
+        logger.info("Loading existing stats from s3://%s/%s", bucket, key)
         body = download_object(client, bucket, key)
         return yaml.safe_load(body) or {}
     except ClientError as exc:
         if exc.response["Error"]["Code"] in ("404", "NoSuchKey"):
+            logger.info("No existing stats file — starting fresh")
             return {}
         raise
+
+
+def log_failed_checks(file_label: str, checks: list[dict]) -> None:
+    for check in checks:
+        if not check.get("passed"):
+            logger.warning(
+                "  FAIL %s: %s — %s",
+                file_label,
+                check.get("check"),
+                check.get("detail"),
+            )
 
 
 def upload_text(client: Any, bucket: str, key: str, body: str, content_type: str) -> None:
@@ -314,12 +352,30 @@ def write_step_summary(lines: list[str]) -> None:
 
 
 def run_validation(args: argparse.Namespace) -> int:
+    logger.info("=" * 60)
+    logger.info("KCSB R2 Schema Monitor — starting")
+    logger.info("Bucket: %s", os.environ.get("CF_R2_BUCKET_NAME", "(not set)"))
+    logger.info(
+        "Options: update_stats=%s quality=%s fail_on_error=%s category=%s date=%s",
+        args.update_stats,
+        args.quality,
+        args.fail_on_error,
+        args.category or "all",
+        args.date or "today UTC",
+    )
+    logger.info("=" * 60)
+
     client = build_r2_client()
     bucket = os.environ["CF_R2_BUCKET_NAME"]
     config = load_config(client, bucket, args.config_local)
 
     scrapers = {s["name"]: s for s in config.get("scrapers", [])}
     schemas = {e["scraper"]: e for e in config.get("excel_schema", [])}
+    logger.info("Config: %d scrapers, %d excel_schema entries", len(scrapers), len(schemas))
+
+    if not scrapers:
+        logger.error("No scrapers defined in config — nothing to validate")
+        return 1
 
     report_date = args.date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     report: dict[str, Any] = {
@@ -331,6 +387,8 @@ def run_validation(args: argparse.Namespace) -> int:
 
     existing_stats = load_existing_stats(client, bucket) if args.update_stats else {}
     updated_stats = dict(existing_stats)
+    if args.update_stats:
+        logger.info("Loaded stats for %d scraper(s)", len(existing_stats))
 
     summary_rows: list[str] = [
         "## KCSB R2 Schema Monitor",
@@ -351,14 +409,37 @@ def run_validation(args: argparse.Namespace) -> int:
             return 1
         target_scrapers = matched
 
-    for scraper_name in target_scrapers:
+    logger.info("Validating %d scraper(s): %s", len(target_scrapers), ", ".join(target_scrapers))
+
+    for scraper_idx, scraper_name in enumerate(target_scrapers, 1):
         scraper_cfg = scrapers[scraper_name]
         schema_cfg = schemas.get(scraper_name, {})
         prefix = normalise_prefix(scraper_cfg["r2_path"])
+        display_name = scraper_cfg.get("display_name", scraper_name)
 
+        logger.info("")
+        logger.info(
+            "[%d/%d] Scraper: %s (%s)",
+            scraper_idx,
+            len(target_scrapers),
+            display_name,
+            scraper_name,
+        )
+        logger.info("  R2 prefix: s3://%s/%s", bucket, prefix)
+
+        if not schema_cfg:
+            logger.warning("  No excel_schema entry for '%s' — file checks will be limited", scraper_name)
+
+        logger.info("  Listing objects in R2...")
         objects = list_objects(client, bucket, prefix)
         xlsx_keys = [o["Key"] for o in objects if o["Key"].lower().endswith(".xlsx")]
         pdf_keys = [o["Key"] for o in objects if o["Key"].lower().endswith(".pdf")]
+        logger.info(
+            "  Found %d total objects — %d xlsx, %d pdf",
+            len(objects),
+            len(xlsx_keys),
+            len(pdf_keys),
+        )
 
         profiles = schema_cfg.get("profiles", [])
         pdf_schema = schema_cfg.get("pdf_schema", {"min_file_size_kb": 10})
@@ -395,6 +476,8 @@ def run_validation(args: argparse.Namespace) -> int:
             else:
                 scraper_result["all_passed"] = False
                 any_failure = True
+            level = logger.info if passed else logger.warning
+            level("  Category check %s: %s", label, scraper_result["category_checks"][-1]["detail"])
 
         observations: dict[str, Any] = {
             "last_run": report_date,
@@ -402,7 +485,14 @@ def run_validation(args: argparse.Namespace) -> int:
             "pdf_count": len(pdf_keys),
         }
 
+        file_total = len(xlsx_keys) + len(pdf_keys)
+        file_num = 0
+
         for key in xlsx_keys:
+            file_num += 1
+            filename = PurePosixPath(key).name
+            logger.info("  [%d/%d] Inspecting xlsx: %s", file_num, file_total, filename)
+            logger.debug("    Full key: %s", key)
             content = download_object(client, bucket, key)
             profile = match_profile(key, profiles)
             file_entry: dict[str, Any] = {
@@ -424,6 +514,7 @@ def run_validation(args: argparse.Namespace) -> int:
                 file_entry["passed"] = False
                 scraper_result["all_passed"] = False
                 any_failure = True
+                logger.warning("    FAIL — no matching excel_schema profile")
             else:
                 checks, passed = inspect_excel(content, profile, args.quality)
                 file_entry["checks"] = checks
@@ -431,6 +522,9 @@ def run_validation(args: argparse.Namespace) -> int:
                 if not passed:
                     scraper_result["all_passed"] = False
                     any_failure = True
+                    log_failed_checks(filename, checks)
+                else:
+                    logger.info("    PASS — %d check(s)", len(checks))
 
             scraper_result["checks_total"] += len(file_entry["checks"])
             scraper_result["checks_passed"] += sum(1 for c in file_entry["checks"] if c["passed"])
@@ -446,6 +540,10 @@ def run_validation(args: argparse.Namespace) -> int:
             )
 
         for key in pdf_keys:
+            file_num += 1
+            filename = PurePosixPath(key).name
+            logger.info("  [%d/%d] Inspecting pdf: %s", file_num, file_total, filename)
+            logger.debug("    Full key: %s", key)
             content = download_object(client, bucket, key)
             checks, passed = inspect_pdf(content, pdf_schema)
             file_entry = {
@@ -458,6 +556,9 @@ def run_validation(args: argparse.Namespace) -> int:
             if not passed:
                 scraper_result["all_passed"] = False
                 any_failure = True
+                log_failed_checks(filename, checks)
+            else:
+                logger.info("    PASS — %d check(s)", len(checks))
             scraper_result["checks_total"] += len(checks)
             scraper_result["checks_passed"] += sum(1 for c in checks if c["passed"])
             scraper_result["files"].append(file_entry)
@@ -465,6 +566,14 @@ def run_validation(args: argparse.Namespace) -> int:
         report["scrapers"][scraper_name] = scraper_result
 
         status = "PASS" if scraper_result["all_passed"] else "FAIL"
+        logger.info(
+            "  Scraper result: %s — %d/%d checks passed (%d xlsx, %d pdf)",
+            status,
+            scraper_result["checks_passed"],
+            scraper_result["checks_total"],
+            len(xlsx_keys),
+            len(pdf_keys),
+        )
         summary_rows.append(
             f"| {scraper_cfg.get('display_name', scraper_name)} "
             f"| {len(xlsx_keys)} | {len(pdf_keys)} "
@@ -476,11 +585,14 @@ def run_validation(args: argparse.Namespace) -> int:
             updated_stats = merge_stats(updated_stats, scraper_name, observations)
 
     report_key = f"{MONITOR_PREFIX}/{report_date}/report.json"
+    logger.info("")
+    logger.info("Uploading report to s3://%s/%s", bucket, report_key)
     upload_text(client, bucket, report_key, json.dumps(report, ensure_ascii=False, indent=2), "application/json")
-    print(f"Report uploaded to s3://{bucket}/{report_key}")
+    logger.info("Report uploaded successfully")
 
     if args.update_stats:
         stats_key = f"{MONITOR_PREFIX}/monitor_stats.yml"
+        logger.info("Uploading stats to s3://%s/%s", bucket, stats_key)
         upload_text(
             client,
             bucket,
@@ -488,7 +600,19 @@ def run_validation(args: argparse.Namespace) -> int:
             yaml.dump(updated_stats, allow_unicode=True, default_flow_style=False),
             "text/yaml",
         )
-        print(f"Stats uploaded to s3://{bucket}/{stats_key}")
+        logger.info("Stats uploaded successfully")
+
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("SUMMARY")
+    for row in summary_rows:
+        if row.startswith("|") and not row.startswith("|-"):
+            logger.info(row.replace("|", " ").strip())
+        elif row.startswith("##") or row.startswith("**"):
+            logger.info(row.replace("*", "").strip())
+    overall = "FAIL" if any_failure else "PASS"
+    logger.info("Overall result: %s", overall)
+    logger.info("=" * 60)
 
     for row in summary_rows:
         print(row.replace("|", " ").strip())
@@ -514,7 +638,9 @@ def main() -> None:
     parser.add_argument("--update-stats", action="store_true", help="Merge observations into monitor_stats.yml in R2")
     parser.add_argument("--quality", action="store_true", help="Run deep null-percentage checks on text Excel files")
     parser.add_argument("--fail-on-error", action="store_true", help="Exit 1 if any check failed")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Debug logging (full R2 keys per file)")
     args = parser.parse_args()
+    setup_logging(args.verbose)
     raise SystemExit(run_validation(args))
 
 
