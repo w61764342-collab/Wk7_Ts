@@ -565,11 +565,15 @@ def run_validation(args: argparse.Namespace) -> int:
         pdf_schema = schema_cfg.get("pdf_schema", {"min_file_size_kb": 10})
         expectations = schema_cfg.get("expectations", {})
 
+        file_count = len(xlsx_keys) + len(pdf_keys)
         scraper_result: dict[str, Any] = {
             "r2_prefix": prefix,
-            "files_found": len(xlsx_keys) + len(pdf_keys),
+            "files_found": file_count,
             "xlsx_count": len(xlsx_keys),
             "pdf_count": len(pdf_keys),
+            "unique_ads": file_count,
+            "total_rows": file_count,
+            "ads_source": "file_count",
             "files": [],
             "category_checks": [],
             "checks_passed": 0,
@@ -703,6 +707,10 @@ def run_validation(args: argparse.Namespace) -> int:
 
         if args.update_stats:
             updated_stats = merge_stats(updated_stats, scraper_name, observations)
+
+    report["total_unique_ads"] = sum(
+        s.get("unique_ads") or 0 for s in report["scrapers"].values()
+    )
 
     report_key = f"{MONITOR_PREFIX}/{report_date}/report.json"
     logger.info("")
