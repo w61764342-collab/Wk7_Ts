@@ -1,5 +1,9 @@
 name: KCSB R2 Schema Monitor
 
+permissions:
+  contents: read
+  actions: read
+
 on:
   # Primary: run after the quarterly Cloudflare R2 scraper completes successfully
   workflow_run:

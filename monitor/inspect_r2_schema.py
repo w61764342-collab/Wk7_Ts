@@ -26,6 +26,15 @@ from botocore.exceptions import ClientError
 import xlrd
 from openpyxl import load_workbook
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from github_workflows import build_scraper_run_meta, load_site_run_meta
+from request_metrics import (
+    aggregate_site_request_metrics,
+    build_run_error_summary,
+    count_scraper_request_metrics,
+)
+from r2_file_counter import count_scraper_r2_files, count_site_r2_files
+
 MONITOR_PREFIX = "KCSB-Data/monitor"
 CONFIG_R2_KEY = f"{MONITOR_PREFIX}/websites-config.yml"
 SEVERITY_CRITICAL = "critical"
@@ -472,6 +481,7 @@ def write_step_summary(lines: list[str]) -> None:
 
 
 def run_validation(args: argparse.Namespace) -> int:
+    run_started_at = datetime.now(timezone.utc)
     logger.info("=" * 60)
     logger.info("KCSB R2 Schema Monitor — starting")
     logger.info("Bucket: %s", os.environ.get("CF_R2_BUCKET_NAME", "(not set)"))
@@ -581,6 +591,13 @@ def run_validation(args: argparse.Namespace) -> int:
             "all_passed": True,
         }
 
+        # Attach cumulative R2 inventory for this scraper (all objects under prefix)
+        try:
+            scraper_result["r2_file_count"] = count_scraper_r2_files(client, bucket, prefix)
+        except Exception as exc:
+            logger.warning("failed to calculate r2_file_count for %s: %s", scraper_name, exc)
+            scraper_result["r2_file_count"] = 0
+
         min_xlsx = expectations.get("min_xlsx_files", 0)
         min_pdf = expectations.get("min_pdf_files", 0)
         for label, count, minimum, severity in [
@@ -687,6 +704,21 @@ def run_validation(args: argparse.Namespace) -> int:
             scraper_result["checks_passed"] += sum(1 for c in checks if c["passed"])
             scraper_result["files"].append(file_entry)
 
+        # Attach request metrics from per-scraper JSON summaries (if present)
+        try:
+            req_stats = count_scraper_request_metrics(client, bucket, prefix, report_date)
+            if req_stats.get("metrics_source") and req_stats.get("metrics_source") != "none":
+                scraper_result["requests_total"] = req_stats.get("requests_total")
+                scraper_result["requests_failed"] = req_stats.get("requests_failed")
+                scraper_result["error_rate_pct"] = req_stats.get("error_rate_pct")
+                scraper_result["requests_per_min"] = req_stats.get("requests_per_min")
+                scraper_result["duration_sec"] = req_stats.get("duration_sec")
+                scraper_result["metrics_source"] = req_stats.get("metrics_source", "json_summary")
+                if req_stats.get("failed_items_summary"):
+                    scraper_result["failed_items_summary"] = req_stats.get("failed_items_summary")
+        except Exception as exc:
+            logger.debug("request metrics lookup failed for %s: %s", scraper_name, exc)
+
         report["scrapers"][scraper_name] = scraper_result
 
         status = "PASS" if scraper_result["all_passed"] else "FAIL"
@@ -711,6 +743,34 @@ def run_validation(args: argparse.Namespace) -> int:
     report["total_unique_ads"] = sum(
         s.get("unique_ads") or 0 for s in report["scrapers"].values()
     )
+
+    # Site-level total R2 inventory: prefer explicit site r2_prefix from config
+    site_r2_prefix = (config.get("r2_prefix") or "").strip("/")
+    if site_r2_prefix:
+        try:
+            report["total_r2_files"] = count_site_r2_files(client, bucket, site_r2_prefix)
+        except Exception as exc:
+            logger.warning("failed to calculate total_r2_files for site: %s", exc)
+            report["total_r2_files"] = sum(s.get("r2_file_count") or 0 for s in report["scrapers"].values())
+    else:
+        report["total_r2_files"] = sum(s.get("r2_file_count") or 0 for s in report["scrapers"].values())
+
+    # Aggregate site-level request metrics and build error summary
+    try:
+        site_metrics = aggregate_site_request_metrics(list(report["scrapers"].values()))
+        report.update(site_metrics)
+        report["error_summary"] = build_run_error_summary(list(report["scrapers"].values()), None)
+    except Exception as exc:
+        logger.debug("failed to aggregate site request metrics: %s", exc)
+
+    site_meta = load_site_run_meta()
+    report["github_run"] = build_scraper_run_meta(
+        site_meta,
+        report_date,
+        run_started_at.replace(tzinfo=None),
+        not any_failure,
+    )
+    report["run_place"] = report["github_run"].get("run_place")
 
     report_key = f"{MONITOR_PREFIX}/{report_date}/report.json"
     logger.info("")

@@ -12,8 +12,6 @@ DOC/cf_doc.md
 monitor_stats.yml
 monitor/report_*.json
 monitor.md
-prompts/excel-schema-prompt.md
 websites-config.yml
-prompts/monitor-prompt.md
+prompts/*
 monitor/site.yml
-prompts/ads.md

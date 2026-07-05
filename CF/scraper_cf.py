@@ -5,6 +5,7 @@ import boto3
 from botocore.exceptions import NoCredentialsError
 from botocore.config import Config
 import time
+import json
 import logging
 from urllib.parse import urljoin, quote
 import re
@@ -72,10 +73,47 @@ class KCSBScraper:
         self.s3_lock = Lock()
         self.session_lock = Lock()
         self.request_count = 0
+        self.requests_failed = 0
         self.request_lock = Lock()
 
         # S3 cache to reduce redundant checks
         self.s3_exists_cache = {}
+
+    def http_get(self, url, **kwargs):
+        try:
+            with self.request_lock:
+                self.request_count += 1
+            resp = self.session.get(url, **kwargs)
+            try:
+                if resp.status_code >= 400:
+                    with self.request_lock:
+                        self.requests_failed += 1
+            except Exception:
+                with self.request_lock:
+                    self.requests_failed += 1
+            return resp
+        except Exception:
+            with self.request_lock:
+                self.requests_failed += 1
+            raise
+
+    def http_post(self, url, data=None, **kwargs):
+        try:
+            with self.request_lock:
+                self.request_count += 1
+            resp = self.session.post(url, data=data, **kwargs)
+            try:
+                if resp.status_code >= 400:
+                    with self.request_lock:
+                        self.requests_failed += 1
+            except Exception:
+                with self.request_lock:
+                    self.requests_failed += 1
+            return resp
+        except Exception:
+            with self.request_lock:
+                self.requests_failed += 1
+            raise
 
     def sanitize_filename(self, filename):
         """Remove or replace invalid characters for file names"""
@@ -91,7 +129,7 @@ class KCSBScraper:
         for attempt in range(1, max_retries + 1):
             try:
                 logger.info(f"Fetching categories (attempt {attempt}/{max_retries})...")
-                response = self.session.get(url, timeout=60)
+                response = self.http_get(url, timeout=60)
                 response.raise_for_status()
                 soup = BeautifulSoup(response.content, 'html.parser')
                 break  # Success, exit retry loop
@@ -177,12 +215,7 @@ class KCSBScraper:
         for attempt in range(1, max_retries + 1):
             try:
                 # Add small delay to avoid overwhelming server
-                with self.request_lock:
-                    self.request_count += 1
-                    if self.request_count % 10 == 0:
-                        time.sleep(1)  # Brief pause every 10 requests
-
-                response = self.session.get(category_url, timeout=60)
+                response = self.http_get(category_url, timeout=60)
                 response.raise_for_status()
                 soup = BeautifulSoup(response.content, 'html.parser')
                 break  # Success, exit retry loop
@@ -426,7 +459,7 @@ class KCSBScraper:
         for attempt in range(1, max_retries + 1):
             try:
                 # STEP 1: Get the page to extract ViewState
-                response = self.session.get(category_url, timeout=60)
+                response = self.http_get(category_url, timeout=60)
                 response.raise_for_status()
                 soup = BeautifulSoup(response.content, 'html.parser')
 
@@ -493,7 +526,7 @@ class KCSBScraper:
 
                 # STEP 2: Post to open detail/modal view
                 logger.debug(f"Step 1: Posting to {event_target}")
-                first_response = self.session.post(
+                first_response = self.http_post(
                     form_action_url,
                     data=form_data,
                     headers=post_headers,
@@ -594,7 +627,7 @@ class KCSBScraper:
                                                     form_data2[name] = inp.get('value', '')
 
                                         # Download this file
-                                        download_response = self.session.post(
+                                        download_response = self.http_post(
                                             form_action_url,
                                             data=form_data2,
                                             headers=post_headers,
@@ -629,7 +662,7 @@ class KCSBScraper:
                                         if idx < len(matching_links):
                                             time.sleep(0.5)  # Brief delay between downloads
                                             # Re-fetch the expanded section
-                                            refresh_response = self.session.post(
+                                            refresh_response = self.http_post(
                                                 form_action_url,
                                                 data=form_data,  # Use original form data to keep section expanded
                                                 headers=post_headers,
@@ -671,7 +704,7 @@ class KCSBScraper:
 
                                 # STEP 4: Post to download link
                                 logger.debug(f"Step 2: Posting to {download_event_target}")
-                                download_response = self.session.post(
+                                download_response = self.http_post(
                                     form_action_url,
                                     data=form_data2,
                                     headers=post_headers,
@@ -930,6 +963,7 @@ class KCSBScraper:
 
     def run(self, filter_main_category=None):
         """Main execution method"""
+        start_time = time.time()
         if filter_main_category:
             logger.info(f"Starting KCSB data scraping (R2) for category: {filter_main_category}")
         else:
@@ -988,6 +1022,32 @@ class KCSBScraper:
         logger.info(f"Already existed (skipped): {total_stats['skipped']}")
         logger.info(f"Failed: {total_stats['failed']}")
         logger.info("="*50)
+        duration_sec = time.time() - start_time
+        # Build and upload JSON summary with request metrics
+        try:
+            from datetime import datetime
+
+            report_date = datetime.utcnow().date()
+            y, m, d = report_date.year, report_date.month, report_date.day
+            ymd = report_date.strftime("%Y%m%d")
+            summary = {
+                "scraped_at": datetime.utcnow().isoformat(),
+                "saved_to_s3_date": report_date.isoformat(),
+                "total_listings": total_stats['total'],
+                "request_metrics": {
+                    "requests_total": self.request_count,
+                    "requests_failed": self.requests_failed,
+                    "requests_per_min": round(self.request_count / (duration_sec / 60), 2) if duration_sec > 0 else 0,
+                    "duration_sec": duration_sec,
+                    "cache_hits": getattr(self, 'cache_hits', 0),
+                    "failed_items": [],
+                },
+            }
+            summary_key = f"{self.base_s3_path}/scraper_cf/year={y}/month={m:02d}/day={d:02d}/json-files/summary_{ymd}.json"
+            self.upload_to_s3(json.dumps(summary, ensure_ascii=False).encode('utf-8'), summary_key)
+            logger.info("Uploaded request_metrics summary to R2: %s", summary_key)
+        except Exception as exc:
+            logger.warning("Failed to upload request_metrics summary: %s", exc)
 
 
 if __name__ == "__main__":
