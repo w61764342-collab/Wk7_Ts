@@ -15,3 +15,5 @@ monitor.md
 websites-config.yml
 prompts/*
 monitor/site.yml
+.venv/*
+*/__pycache__/*

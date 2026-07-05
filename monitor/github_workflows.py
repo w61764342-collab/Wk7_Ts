@@ -152,6 +152,31 @@ def merge_registry_site(site: Dict, registry: Optional[Dict]) -> Dict:
     return merged
 
 
+def load_site_run_meta(path: Optional[Union[str, Path]] = None) -> Dict[str, Any]:
+    """Load the local site metadata used for monitor workflow reporting."""
+    candidates = []
+    if path:
+        candidates.append(Path(path))
+    candidates.extend([
+        Path(__file__).resolve().with_name("site.yml"),
+        Path(__file__).resolve().parent.parent / "site.yml",
+    ])
+
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        try:
+            with candidate.open("r", encoding="utf-8") as fh:
+                data = yaml.safe_load(fh) or {}
+            if isinstance(data, dict):
+                return data
+        except (OSError, yaml.YAMLError) as exc:
+            log.warning("Failed to load site metadata from %s: %s", candidate, exc)
+            break
+
+    return {}
+
+
 def _lookback_start(partition_date: str, schedule: Optional[str]) -> datetime:
     sched = (schedule or "daily").lower().replace(" ", "_").replace("-", "_")
     days = _SCHEDULE_LOOKBACK_DAYS.get(sched, 2)
