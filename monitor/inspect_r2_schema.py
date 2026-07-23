@@ -764,12 +764,18 @@ def run_validation(args: argparse.Namespace) -> int:
         logger.debug("failed to aggregate site request metrics: %s", exc)
 
     site_meta = load_site_run_meta()
-    report["github_run"] = build_scraper_run_meta(
+    github_run = build_scraper_run_meta(
         site_meta,
         report_date,
         run_started_at.replace(tzinfo=None),
         not any_failure,
     )
+    github_gmail = (site_meta.get("github_gmail") or site_meta.get("github_email") or "").strip()
+    if github_gmail:
+        github_run["github_gmail"] = github_gmail
+    report["github_run"] = github_run
+    if github_gmail:
+        report["github_gmail"] = github_gmail
     report["run_place"] = report["github_run"].get("run_place")
 
     report_key = f"{MONITOR_PREFIX}/{report_date}/report.json"
