@@ -33,7 +33,14 @@ from request_metrics import (
     build_run_error_summary,
     count_scraper_request_metrics,
 )
-from r2_file_counter import count_scraper_r2_files, count_site_r2_files
+from r2_file_counter import (
+    count_scraper_r2_daily_size_bytes,
+    count_scraper_r2_files,
+    count_scraper_r2_size_bytes,
+    count_site_r2_daily_size_bytes,
+    count_site_r2_files,
+    count_site_r2_size_bytes,
+)
 
 MONITOR_PREFIX = "KCSB-Data/monitor"
 CONFIG_R2_KEY = f"{MONITOR_PREFIX}/websites-config.yml"
@@ -472,6 +479,20 @@ def merge_stats(existing: dict, scraper: str, observations: dict) -> dict:
     return stats
 
 
+def format_bytes(num_bytes: int | None) -> str:
+    """Human-readable size for console/summary output."""
+    size = int(num_bytes or 0)
+    units = ("B", "KB", "MB", "GB", "TB")
+    value = float(size)
+    unit_idx = 0
+    while value >= 1024.0 and unit_idx < len(units) - 1:
+        value /= 1024.0
+        unit_idx += 1
+    if unit_idx == 0:
+        return f"{int(value)} {units[unit_idx]}"
+    return f"{value:.2f} {units[unit_idx]}"
+
+
 def write_step_summary(lines: list[str]) -> None:
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary_path:
@@ -525,8 +546,8 @@ def run_validation(args: argparse.Namespace) -> int:
         "",
         f"**Report date:** {report_date}",
         "",
-        "| Scraper | XLSX | PDF | Checks | Status |",
-        "|---------|------|-----|--------|--------|",
+        "| Scraper | XLSX | PDF | R2 files | R2 size | R2 daily size | Checks | Status |",
+        "|---------|------|-----|----------|---------|----------------|--------|--------|",
     ]
 
     any_failure = False
@@ -594,9 +615,15 @@ def run_validation(args: argparse.Namespace) -> int:
         # Attach cumulative R2 inventory for this scraper (all objects under prefix)
         try:
             scraper_result["r2_file_count"] = count_scraper_r2_files(client, bucket, prefix)
+            scraper_result["r2_size_bytes"] = count_scraper_r2_size_bytes(client, bucket, prefix)
+            scraper_result["r2_daily_size"] = count_scraper_r2_daily_size_bytes(
+                client, bucket, prefix, report_date
+            )
         except Exception as exc:
-            logger.warning("failed to calculate r2_file_count for %s: %s", scraper_name, exc)
+            logger.warning("failed to calculate R2 inventory for %s: %s", scraper_name, exc)
             scraper_result["r2_file_count"] = 0
+            scraper_result["r2_size_bytes"] = 0
+            scraper_result["r2_daily_size"] = 0
 
         min_xlsx = expectations.get("min_xlsx_files", 0)
         min_pdf = expectations.get("min_pdf_files", 0)
@@ -733,6 +760,9 @@ def run_validation(args: argparse.Namespace) -> int:
         summary_rows.append(
             f"| {scraper_cfg.get('display_name', scraper_name)} "
             f"| {len(xlsx_keys)} | {len(pdf_keys)} "
+            f"| {scraper_result.get('r2_file_count', 0)} "
+            f"| {format_bytes(scraper_result.get('r2_size_bytes'))} "
+            f"| {format_bytes(scraper_result.get('r2_daily_size'))} "
             f"| {scraper_result['checks_passed']}/{scraper_result['checks_total']} "
             f"| {status} |"
         )
@@ -745,15 +775,31 @@ def run_validation(args: argparse.Namespace) -> int:
     )
 
     # Site-level total R2 inventory: prefer explicit site r2_prefix from config
-    site_r2_prefix = (config.get("r2_prefix") or "").strip("/")
+    site_r2_prefix = (config.get("r2_prefix") or "KCSB-Data").strip("/")
+    scraper_results = list(report["scrapers"].values())
     if site_r2_prefix:
         try:
             report["total_r2_files"] = count_site_r2_files(client, bucket, site_r2_prefix)
+            report["total_r2_size_bytes"] = count_site_r2_size_bytes(client, bucket, site_r2_prefix)
+            report["total_r2_daily_size"] = count_site_r2_daily_size_bytes(
+                client, bucket, site_r2_prefix, report_date
+            )
         except Exception as exc:
-            logger.warning("failed to calculate total_r2_files for site: %s", exc)
-            report["total_r2_files"] = sum(s.get("r2_file_count") or 0 for s in report["scrapers"].values())
+            logger.warning("failed to calculate site R2 inventory: %s", exc)
+            report["total_r2_files"] = sum(s.get("r2_file_count") or 0 for s in scraper_results)
+            report["total_r2_size_bytes"] = sum(s.get("r2_size_bytes") or 0 for s in scraper_results)
+            report["total_r2_daily_size"] = sum(s.get("r2_daily_size") or 0 for s in scraper_results)
     else:
-        report["total_r2_files"] = sum(s.get("r2_file_count") or 0 for s in report["scrapers"].values())
+        report["total_r2_files"] = sum(s.get("r2_file_count") or 0 for s in scraper_results)
+        report["total_r2_size_bytes"] = sum(s.get("r2_size_bytes") or 0 for s in scraper_results)
+        report["total_r2_daily_size"] = sum(s.get("r2_daily_size") or 0 for s in scraper_results)
+
+    summary_rows.extend([
+        "",
+        f"**Total R2 files:** {report['total_r2_files']}",
+        f"**Total R2 size:** {format_bytes(report.get('total_r2_size_bytes'))}",
+        f"**Total R2 daily size:** {format_bytes(report.get('total_r2_daily_size'))}",
+    ])
 
     # Aggregate site-level request metrics and build error summary
     try:
