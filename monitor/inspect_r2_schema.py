@@ -34,11 +34,15 @@ from request_metrics import (
     count_scraper_request_metrics,
 )
 from r2_file_counter import (
+    FILE_TYPE_CATEGORIES,
+    count_daily_r2_inventory_by_type,
     count_scraper_r2_daily_size_bytes,
     count_scraper_r2_files,
+    count_scraper_r2_inventory_by_type,
     count_scraper_r2_size_bytes,
     count_site_r2_daily_size_bytes,
     count_site_r2_files,
+    count_site_r2_inventory_by_type,
     count_site_r2_size_bytes,
 )
 
@@ -493,6 +497,30 @@ def format_bytes(num_bytes: int | None) -> str:
     return f"{value:.2f} {units[unit_idx]}"
 
 
+def flatten_type_byte_fields(by_type_bytes: dict[str, int], field_prefix: str) -> dict[str, int]:
+    """Map inventory by_type_bytes to flattened report.json field names."""
+    return {
+        f"{field_prefix}_{category}_bytes": int(by_type_bytes.get(category) or 0)
+        for category in FILE_TYPE_CATEGORIES
+    }
+
+
+def sum_scraper_type_byte_fields(
+    scraper_results: list[dict[str, Any]],
+    source_prefix: str,
+    target_prefix: str | None = None,
+) -> dict[str, int]:
+    """Sum type-byte fields across scraper results, optionally renaming the prefix."""
+    dest_prefix = target_prefix or source_prefix
+    totals = flatten_type_byte_fields({}, dest_prefix)
+    for result in scraper_results:
+        for category in FILE_TYPE_CATEGORIES:
+            source_field = f"{source_prefix}_{category}_bytes"
+            target_field = f"{dest_prefix}_{category}_bytes"
+            totals[target_field] = totals.get(target_field, 0) + int(result.get(source_field) or 0)
+    return totals
+
+
 def write_step_summary(lines: list[str]) -> None:
     summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not summary_path:
@@ -619,11 +647,21 @@ def run_validation(args: argparse.Namespace) -> int:
             scraper_result["r2_daily_size"] = count_scraper_r2_daily_size_bytes(
                 client, bucket, prefix, report_date
             )
+            total_inventory = count_scraper_r2_inventory_by_type(client, bucket, prefix)
+            daily_inventory = count_daily_r2_inventory_by_type(
+                client, bucket, prefix, report_date
+            )
+            scraper_result.update(flatten_type_byte_fields(total_inventory["by_type_bytes"], "r2"))
+            scraper_result.update(
+                flatten_type_byte_fields(daily_inventory["by_type_bytes"], "r2_daily")
+            )
         except Exception as exc:
             logger.warning("failed to calculate R2 inventory for %s: %s", scraper_name, exc)
             scraper_result["r2_file_count"] = 0
             scraper_result["r2_size_bytes"] = 0
             scraper_result["r2_daily_size"] = 0
+            scraper_result.update(flatten_type_byte_fields({}, "r2"))
+            scraper_result.update(flatten_type_byte_fields({}, "r2_daily"))
 
         min_xlsx = expectations.get("min_xlsx_files", 0)
         min_pdf = expectations.get("min_pdf_files", 0)
@@ -784,15 +822,23 @@ def run_validation(args: argparse.Namespace) -> int:
             report["total_r2_daily_size"] = count_site_r2_daily_size_bytes(
                 client, bucket, site_r2_prefix, report_date
             )
+            site_inventory = count_site_r2_inventory_by_type(client, bucket, site_r2_prefix)
+            report.update(
+                flatten_type_byte_fields(site_inventory["by_type_bytes"], "total_r2")
+            )
         except Exception as exc:
             logger.warning("failed to calculate site R2 inventory: %s", exc)
             report["total_r2_files"] = sum(s.get("r2_file_count") or 0 for s in scraper_results)
             report["total_r2_size_bytes"] = sum(s.get("r2_size_bytes") or 0 for s in scraper_results)
             report["total_r2_daily_size"] = sum(s.get("r2_daily_size") or 0 for s in scraper_results)
+            report.update(sum_scraper_type_byte_fields(scraper_results, "r2", "total_r2"))
     else:
         report["total_r2_files"] = sum(s.get("r2_file_count") or 0 for s in scraper_results)
         report["total_r2_size_bytes"] = sum(s.get("r2_size_bytes") or 0 for s in scraper_results)
         report["total_r2_daily_size"] = sum(s.get("r2_daily_size") or 0 for s in scraper_results)
+        report.update(sum_scraper_type_byte_fields(scraper_results, "r2", "total_r2"))
+
+    report.update(sum_scraper_type_byte_fields(scraper_results, "r2_daily", "total_r2_daily"))
 
     summary_rows.extend([
         "",

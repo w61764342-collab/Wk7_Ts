@@ -15,9 +15,29 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, timezone
+from pathlib import PurePosixPath
 from typing import Any, Iterator
 
 log = logging.getLogger("monitor")
+
+FILE_TYPE_CATEGORIES = ("images", "json", "excel", "csv", "parquet", "other")
+
+_EXTENSION_TO_CATEGORY: dict[str, str] = {
+    ".jpg": "images",
+    ".jpeg": "images",
+    ".png": "images",
+    ".webp": "images",
+    ".gif": "images",
+    ".bmp": "images",
+    ".tiff": "images",
+    ".svg": "images",
+    ".json": "json",
+    ".xlsx": "excel",
+    ".xls": "excel",
+    ".xlsm": "excel",
+    ".csv": "csv",
+    ".parquet": "parquet",
+}
 
 
 def _normalise_list_prefix(prefix: str) -> str:
@@ -33,9 +53,35 @@ def _parse_partition_date(partition_dt: datetime | date | str) -> date:
     return datetime.fromisoformat(str(partition_dt)).date()
 
 
-def _date_partition(partition_dt: datetime | date | str) -> str:
+def _date_partition_variants(partition_dt: datetime | date | str) -> tuple[str, str]:
+    """Padded and unpadded Hive-style date path segments for the same calendar day."""
     day = _parse_partition_date(partition_dt)
-    return f"year={day.year}/month={day.month:02d}/day={day.day:02d}"
+    padded = f"year={day.year}/month={day.month:02d}/day={day.day:02d}"
+    unpadded = f"year={day.year}/month={day.month}/day={day.day}"
+    return padded, unpadded
+
+
+def _empty_inventory() -> dict[str, Any]:
+    return {
+        "objects": 0,
+        "size_bytes": 0,
+        "by_type_objects": {category: 0 for category in FILE_TYPE_CATEGORIES},
+        "by_type_bytes": {category: 0 for category in FILE_TYPE_CATEGORIES},
+    }
+
+
+def _file_category(key: str) -> str:
+    extension = PurePosixPath(key).suffix.lower()
+    return _EXTENSION_TO_CATEGORY.get(extension, "other")
+
+
+def _accumulate_object(inventory: dict[str, Any], obj: dict) -> None:
+    size = int(obj.get("Size") or 0)
+    category = _file_category(obj.get("Key", ""))
+    inventory["objects"] += 1
+    inventory["size_bytes"] += size
+    inventory["by_type_objects"][category] += 1
+    inventory["by_type_bytes"][category] += size
 
 
 def _resolve_scraper_base(r2_base: str, category_slug: str | None = None) -> str:
@@ -63,9 +109,9 @@ def _iter_r2_objects(client: Any, bucket: str, prefix: str) -> Iterator[dict]:
 
 def _object_matches_daily_partition(obj: dict, partition_dt: datetime | date | str) -> bool:
     key = obj.get("Key", "")
-    partition = _date_partition(partition_dt)
-    if f"/{partition}/" in key or key.startswith(partition):
-        return True
+    for partition in _date_partition_variants(partition_dt):
+        if f"/{partition}/" in key or key.startswith(partition):
+            return True
 
     modified = obj.get("LastModified")
     if modified is None:
@@ -73,6 +119,94 @@ def _object_matches_daily_partition(obj: dict, partition_dt: datetime | date | s
     if modified.tzinfo is None:
         modified = modified.replace(tzinfo=timezone.utc)
     return modified.astimezone(timezone.utc).date() == _parse_partition_date(partition_dt)
+
+
+def count_r2_inventory_by_type(client: Any, bucket: str, prefix: str) -> dict[str, Any]:
+    """Count objects and byte sizes under *prefix*, grouped by file extension category."""
+    inventory = _empty_inventory()
+    try:
+        for obj in _iter_r2_objects(client, bucket, prefix):
+            _accumulate_object(inventory, obj)
+    except Exception as exc:
+        log.warning(
+            "R2 inventory by type failed for prefix %r: %s",
+            _normalise_list_prefix(prefix),
+            exc,
+        )
+        return _empty_inventory()
+    return inventory
+
+
+def count_daily_r2_inventory_by_type(
+    client: Any,
+    bucket: str,
+    r2_base: str,
+    partition_dt: datetime | date | str,
+    category_slug: str | None = None,
+) -> dict[str, Any]:
+    """Inventory for one report date under a scraper/site prefix (single pass, deduped by key)."""
+    base = _resolve_scraper_base(r2_base, category_slug)
+    if not base:
+        return _empty_inventory()
+
+    inventory = _empty_inventory()
+    seen_keys: set[str] = set()
+    try:
+        for obj in _iter_r2_objects(client, bucket, base):
+            key = obj.get("Key", "")
+            if not key or key in seen_keys:
+                continue
+            if not _object_matches_daily_partition(obj, partition_dt):
+                continue
+            seen_keys.add(key)
+            _accumulate_object(inventory, obj)
+    except Exception as exc:
+        log.warning("R2 daily inventory by type failed for prefix %r: %s", base, exc)
+        return _empty_inventory()
+
+    log.debug(
+        "  R2 daily inventory by type %s (%s): %d object(s), %d byte(s)",
+        base,
+        partition_dt,
+        inventory["objects"],
+        inventory["size_bytes"],
+    )
+    return inventory
+
+
+def count_scraper_r2_inventory_by_type(
+    client: Any,
+    bucket: str,
+    r2_base: str,
+    category_slug: str | None = None,
+) -> dict[str, Any]:
+    """Total inventory under one scraper/category prefix, grouped by file type."""
+    base = _resolve_scraper_base(r2_base, category_slug)
+    if not base:
+        return _empty_inventory()
+    inventory = count_r2_inventory_by_type(client, bucket, base)
+    log.debug(
+        "  R2 inventory by type %s: %d object(s), %d byte(s)",
+        base,
+        inventory["objects"],
+        inventory["size_bytes"],
+    )
+    return inventory
+
+
+def count_site_r2_inventory_by_type(client: Any, bucket: str, r2_prefix: str) -> dict[str, Any]:
+    """Total inventory under the site's data prefix, grouped by file type."""
+    prefix = r2_prefix.strip("/")
+    if not prefix:
+        return _empty_inventory()
+    inventory = count_r2_inventory_by_type(client, bucket, prefix)
+    log.info(
+        "Site R2 inventory by type (%s): %d object(s), %d byte(s)",
+        prefix,
+        inventory["objects"],
+        inventory["size_bytes"],
+    )
+    return inventory
 
 
 def count_r2_objects(client: Any, bucket: str, prefix: str) -> int:
