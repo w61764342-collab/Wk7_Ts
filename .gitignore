@@ -17,3 +17,8 @@ prompts/*
 monitor/site.yml
 .venv/*
 */__pycache__/*
+DOC/cf_doc.docx
+DOC/monitor_doc.docx
+DOC/monitor_doc.md
+DOC/WEBSITE_BEHAVIOR_ANALYSIS.md
+DOC/WEBSITE_BEHAVIOR_ANALYSIS.docx
