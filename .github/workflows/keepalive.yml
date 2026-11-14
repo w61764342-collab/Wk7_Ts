@@ -1,0 +1,28 @@
+name: Keep scheduled workflows active
+
+on:
+  schedule:
+    - cron: '0 8 1,15 * *'
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Record repository activity
+        run: |
+          date -u +'%Y-%m-%dT%H:%M:%SZ' > .github/workflows/.last-keepalive
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/workflows/.last-keepalive
+          if git diff --cached --quiet; then
+            echo "Keepalive timestamp is unchanged; no commit needed."
+          else
+            git commit -m "chore: keep scheduled workflows active"
+            git push
+          fi

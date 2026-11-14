@@ -38,6 +38,12 @@ The workflow runs **automatically quarterly**:
 
 **Scheduled runs process ALL categories** with 5 workers by default.
 
+### Keeping scheduled workflows active
+
+GitHub may disable scheduled workflows in inactive public repositories after 60 days without repository activity. The `Keep scheduled workflows active` workflow commits a small UTC timestamp file on the 1st and 15th of each month to prevent that inactivity. It needs `contents: write` permission; its `GITHUB_TOKEN` commit does not trigger other workflows.
+
+If a workflow was already disabled, re-enable it once from the repository's **Actions** tab after this keepalive workflow is added.
+
 ## Examples
 
 ### Example 1: Test with One Category
